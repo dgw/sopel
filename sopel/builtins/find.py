@@ -18,6 +18,40 @@ import re
 
 from sopel import plugin
 from sopel.formatting import bold
+from sopel.privileges import AccessLevel
+
+
+# Map channel mode letters to privilege levels required to see
+# messages sent with the corresponding STATUSMSG prefix
+_MODE_PRIVILEGES = {
+    "v": AccessLevel.VOICE,
+    "h": AccessLevel.HALFOP,
+    "o": AccessLevel.OP,
+    "a": AccessLevel.ADMIN,
+    "q": AccessLevel.OWNER,
+    "y": AccessLevel.OPER,
+    "Y": AccessLevel.OPER,
+}
+
+
+def _get_privilege_for_prefix(bot, prefix):
+    """Get the minimum privilege level to see a STATUSMSG with ``prefix``.
+
+    :param bot: the running Sopel instance
+    :param prefix: the STATUSMSG prefix character (e.g. ``@`` or ``+``)
+    :return: the required :class:`~sopel.privileges.AccessLevel`, or ``None``
+             if the prefix can't be mapped to a known privilege
+    """
+    try:
+        prefix_map = bot.isupport.PREFIX  # dict of mode -> prefix_char
+    except AttributeError:
+        return None
+
+    for mode, pfx in prefix_map.items():
+        if pfx == prefix:
+            return _MODE_PRIVILEGES.get(mode)
+
+    return None
 
 
 def setup(bot):
@@ -53,11 +87,12 @@ def collectlines(bot, trigger):
     # Update in-memory list of the user's lines in the channel
     line_list = bot.memory['find_lines'][trigger.sender][trigger.nick]
 
-    # Messages are stored in reverse order (most recent first)
+    # Messages are stored as (text, status_prefix) tuples,
+    # in reverse order (most recent first)
     if line.startswith('\x01ACTION'):
-        line_list.appendleft(line[:-1])
+        line_list.appendleft((line[:-1], trigger.status_prefix))
     else:
-        line_list.appendleft(line)
+        line_list.appendleft((line, trigger.status_prefix))
 
 
 def _cleanup_channel(bot, channel):
@@ -192,7 +227,18 @@ def findandreplace(bot, trigger):
     # Look back through the user's lines in the channel until you find a line
     # where the replacement works
     new_line = new_display = None
-    for line in history:
+    matched_status_prefix = None
+    for line, status_prefix in history:
+        # Skip messages the user doesn't have privilege to see
+        if status_prefix:
+            required_level = _get_privilege_for_prefix(bot, status_prefix)
+            channel_obj = bot.channels.get(trigger.sender)
+            if required_level is None or channel_obj is None:
+                # Can't verify privileges; skip to be safe
+                continue
+            if not channel_obj.has_privilege(trigger.nick, required_level):
+                continue
+
         if line.startswith("\x01ACTION"):
             me = True  # /me command
             line = line[8:]
@@ -202,14 +248,16 @@ def findandreplace(bot, trigger):
         if replaced != line:  # we are done
             new_line = replaced
             new_display = repl(line, bold(new))
+            matched_status_prefix = status_prefix
             break
 
     if not new_line:
         return  # Didn't find anything
 
-    # Save the new "edited" message.
+    # Save the new "edited" message, preserving original status prefix.
     action = (me and '\x01ACTION ') or ''  # If /me message, prepend \x01ACTION
-    history.appendleft(action + new_line)  # history is in most-recent-first order
+    # history is in most-recent-first order
+    history.appendleft((action + new_line, matched_status_prefix))
 
     # output
     if not me:
@@ -219,7 +267,12 @@ def findandreplace(bot, trigger):
     else:
         msg = '%s %s' % (trigger.nick, new_display)
 
-    bot.say(msg)
+    # If the matched message was sent with a STATUSMSG prefix,
+    # address the corrected output to the same restricted audience.
+    if matched_status_prefix:
+        bot.say(msg, matched_status_prefix + str(trigger.sender))
+    else:
+        bot.say(msg)
 
 
 def decode_escape(match):
